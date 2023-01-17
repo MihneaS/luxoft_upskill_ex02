@@ -20,6 +20,7 @@
 #include <mqueue.h>
 #include <pthread.h>
 #include <assert.h>
+#include <string.h>
 #include "utils.h"
 #include "constants.h"
 #include "common.h"

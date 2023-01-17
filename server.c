@@ -20,6 +20,7 @@
 #include <mqueue.h>
 #include <pthread.h>
 #include <assert.h>
+#include <string.h>
 #include "utils.h"
 #include "constants.h"
 #include "common.h"
@@ -37,7 +38,7 @@ typedef struct
 } th_info_t;
 
 static void *th_f(void* args);
-static void wait_for_input(const char * msg)
+static void wait_for_input(const char * msg);
 
 static void *th_f(void* args)
 {
@@ -149,7 +150,7 @@ int main ()
         }
     }
 
-    wait_for_input("May close the server after the clients are done.");
+    wait_for_input("May close the server. Please wait for the clients to finish.");
     rc = mq_unlink(MQ_NAME);
     if (-1 == rc)
     {
