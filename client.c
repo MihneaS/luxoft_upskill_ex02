@@ -71,17 +71,22 @@ int main (int argc, char** argv)
     unsigned int seed = 0;
     pid_t pid = getpid();
     mqd_t mq;
+    const char *program_name = "client";
+
+    if (argc == 0) {
+        program_name = argv[0];
+    }
 
     if (argc != 2)
     {
-        printf("usage:\n%s <seed>\nThe seed have to be greater then 0.", argv[0]);
+        printf("usage:\n%s <seed>\nThe seed have to be greater then 0.", program_name);
         exit(1);
     }
 
     rc = atoi(argv[1]);
     if (rc < 0)
     {
-        printf("Could not convert seed to number or the seed was 0 or negative.\nusage:\n%s <seed>\n", argv[0]);
+        printf("Could not convert seed to number or the seed was 0 or negative.\nusage:\n%s <seed>\n", program_name);
     }
     seed = rc;
 
