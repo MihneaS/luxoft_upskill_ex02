@@ -2,12 +2,14 @@
 /*!
 * \file client.c
 *
-* \brief Written so that the author will learn to use POSIX message queue. This client expects to be executed after the server has been opened. It also exepects a seed as argument
+* \brief Written so that the author will learn to use POSIX message queue.
+*        Starts several processes that will requests tokens from the server and
+*        then start one final that will ask the server to shut down.
 *
 * \author Mihnea SERBAN \n
-* Copyright 2011 Hirschmann Automation and Control GmbH
 *
 * \version 1.0 16.01.2023 Mihnea SERBAN created
+* \version 1.1 23.01.2023 Mihnea SERBAN modified
 *
 *//**************************** FILE HEADER *********************************/
 
@@ -16,96 +18,186 @@
 #include <stdlib.h>         /* For rand() */
 #include <fcntl.h>          /* For O_* constants */
 #include <sys/stat.h>       /* For mode constants */
+#include <sys/wait.h>       /* for waitpid */
 #include <unistd.h>         /* For sleep and getpid*/
 #include <mqueue.h>
 #include <pthread.h>
 #include <assert.h>
 #include <string.h>
+#include <stdbool.h>
 #include "utils.h"
 #include "constants.h"
 #include "common.h"
 
-static void consume();
+static void do_work(uint8_t pseudo_port);
+static void send_close_server_msg();
 
-static void consume(mqd_t mq, unsigned int seed)
-{
-    unsigned int wait_min = CLIENT_CONSUME_WAIT_MIN;
-    unsigned int wait_max = CLIENT_CONSUME_WAIT_MAX;
-    pid_t pid = getpid();
-
-    for (int i = 0; i < CLIENT_CONSUME_RUN_NO; i++)
-    {
-        ticket_msg_t msg = {0}; /* assert that sending operation is blocking */
-        char buf[MQ_MSGSIZE+1] = {0}; /* needs to be bigger then MAX_MSGSIZE */
-        unsigned prio;
-        size_t total_bytes = 0;
-        ssize_t read_bytes = 0;
-
-        static_assert(sizeof(msg) <= MQ_MAXMSG,
-                "real size of message struct is smaller then defined size of"
-                "the message in the mqueue(MQ_MAXMSG).\n");
-        while (total_bytes < sizeof(msg))
-        {
-            read_bytes = mq_receive(
-                    mq,
-                    buf + total_bytes,
-                    sizeof(buf),
-                    &prio);
-            if (-1 == read_bytes)
-            {
-                handle_error();
-            }
-            total_bytes += read_bytes;
-        }
-
-        memcpy(&msg, buf, sizeof(msg));
-
-        printf("%4d consumed %3d\n",pid, msg.val);
-        sleep(rand_r(&seed) % (wait_max - wait_min) + wait_min);
-    }
-}
-
-int main (int argc, char** argv)
+void do_work(uint8_t pseudo_port)
 {
     int rc = 0;
-    unsigned int seed = 0;
     pid_t pid = getpid();
-    mqd_t mq;
-    const char *program_name = "client";
+    char client_mq_name[MAX_MQUEUE_NAME] = {0};
+    mqd_t client_mq;
+    mqd_t server_mq;
+    struct mq_attr qattr = {0};
+    qattr.mq_maxmsg = MQ_MAXMSG;
+    qattr.mq_msgsize = MQ_MSGSIZE;
+    unsigned int seed = (unsigned int)pid; /**< Detailes of the conversion does not matter. */
+    unsigned int msg_prio = MQ_DEFAULT_PRIO;
 
-    if (argc == 0) {
-        program_name = argv[0];
-    }
+    printf("%5d_client: Starting.\n", pid);
+    int wait_max = CLIENT_CONSUME_WAIT_MAX;
+    int wait_min = CLIENT_CONSUME_WAIT_MIN;
 
-    if (argc != 2)
-    {
-        printf("usage:\n%s <seed>\nThe seed have to be greater then 0.", program_name);
-        exit(1);
-    }
-
-    rc = atoi(argv[1]);
-    if (rc < 0)
-    {
-        printf("Could not convert seed to number or the seed was 0 or negative.\nusage:\n%s <seed>\n", program_name);
-    }
-    seed = rc;
-
-    printf(" Starting the client %4d.\n", pid);
-
-    mq = mq_open(MQ_NAME, O_RDONLY);
-    if (-1 == mq)
+    rc = get_client_mq_name(client_mq_name, sizeof(client_mq_name), pseudo_port);
+    if (rc < 0 || (unsigned int)rc > sizeof(client_mq_name))
     {
         handle_error();
     }
-    printf(" Oppened message queue.\n");
-    printf(" Consuming.\n");
-    consume(mq, seed);
+    client_mq = mq_open(client_mq_name, O_RDONLY | O_CREAT, MQ_MODE, &qattr);
+    if (-1 == client_mq)
+    {
+        handle_error();
+    }
+    for (int i = 0; i < CLIENT_CONSUME_RUN_NO; i++)
+    {
+        printf("%5d_client: Run %d.\n", pid, i);
+        sleep(rand_r(&seed) % (wait_max - wait_min) + wait_min);
 
-    rc = mq_close(mq);
+        request_msg_t request = {0};
+        request.req_type = TOKEN;
+        request.token_requested = rand_r(&seed) % (CLIENT_MAX_TOK+1);
+        request.pid = pid;
+        request.pseudo_port = pseudo_port;
+        request.req_time = time(NULL);
+        response_msg_t response;
+        char buf[MQ_MSGSIZE + 1];
+        unsigned int resp_prio = 0;
+        bool discard_msg;
+        if (-1 == request.req_time)
+        {
+            handle_error();
+        }
+        server_mq = mq_open(MQ_REQ_NAME, O_WRONLY | O_CREAT, MQ_MODE, &qattr);
+        if (-1 == server_mq)
+        {
+            handle_error();
+        }
+        printf("%5d_client: Requesting %3d.\n", pid, request.token_requested);
+        rc = mq_send(server_mq, (char*)&request, sizeof(request), msg_prio);
+        if (-1 == rc)
+        {
+            handle_error();
+        }
+        rc = mq_close(server_mq);
+        if (-1 == rc)
+        {
+            handle_error();
+        }
+        do
+        {
+            discard_msg = false;
+            rc = mq_receive(client_mq, buf, sizeof(buf), &resp_prio);
+            if (-1 == rc)
+            {
+                handle_error();
+            }
+            if (rc != sizeof(response)){
+                discard_msg = true;
+                continue;
+            }
+            memcpy(&response, buf, sizeof(response));
+            if (response.pid != pid || response.token_requested != request.token_requested)
+            {
+                printf("%5d_client: Discarding a message.\n", pid);
+                discard_msg = true;
+            }
+        } while(discard_msg == true);
+        switch(response.resp_type)
+        {
+            case ACK:
+                printf("%5d_client: Received token %3d.\n", pid, response.token_requested);
+            break;
+            case TOKEN_NOT_AVAILABLE:
+                printf("%5d_client: Token %3d not available.\n", pid, response.token_requested);
+            break;
+            default:
+                printf("%5d_client: Received unkown response.\n", pid);
+        }
+    }
+    rc = mq_unlink(client_mq_name);
     if (-1 == rc)
     {
         handle_error();
     }
-    printf("Client %d closed.\n", pid);
+    printf("%5d_client: Closing.\n", pid);
+}
+
+static void send_close_server_msg()
+{
+    int rc = 0;
+    pid_t pid = getpid();
+    mqd_t server_mq;
+    struct mq_attr qattr = {0};
+    qattr.mq_maxmsg = MQ_MAXMSG;
+    qattr.mq_msgsize = MQ_MSGSIZE;
+    unsigned int msg_prio = MQ_DEFAULT_PRIO;
+
+    printf("%5d_client: Starting. This client will close the server.\n", pid);
+
+    server_mq = mq_open(MQ_REQ_NAME, O_WRONLY | O_CREAT, MQ_MODE, &qattr);
+    if (-1 == server_mq)
+    {
+        handle_error();
+    }
+    request_msg_t request = {0};
+    request.req_type = CLOSE;
+    request.token_requested = 0;
+    request.pid = pid;
+    request.pseudo_port = 0;
+    request.req_time = time(NULL);
+    if (-1 == request.req_time)
+    {
+        handle_error();
+    }
+    printf("%5d_client: Requesting server closing.\n", pid);
+    rc = mq_send(server_mq, (char*)&request, sizeof(request), msg_prio);
+    if (-1 == rc)
+    {
+        handle_error();
+    }
+}
+
+int main()
+{
+    int first_pseudo_port = 100;
+    pid_t children[CLIENT_CONSUME_RUN_NO];
+    for (int i = 0; i < CLIENT_CONSUME_WORKERS_NO; i++)
+    {
+        children[i] = fork();
+        if (0 == children[i])
+        {
+            do_work(first_pseudo_port + i);
+            exit(0);
+        }
+        else if (-1 == children[i])
+        {
+            handle_error();
+        }
+    }
+
+    for (int i = 0; i < CLIENT_CONSUME_WORKERS_NO; i++)
+    {
+        int status;
+        pid_t rc;
+        rc = waitpid(children[i], &status, 0);
+        if (-1 == rc)
+        {
+            handle_error();
+        }
+    }
+
+    send_close_server_msg();
+
     return 0;
 }
